@@ -24,6 +24,7 @@ Key Features:
   same number of minibatches.
 """
 from itertools import chain
+from deprecated import deprecated
 
 import torch
 from torch.utils.data import Sampler, Dataset, DataLoader
@@ -34,6 +35,114 @@ from datasets import load_dataset
 def reset_minibatches(num_ranks: int):
     return [[] for _ in range(num_ranks)], np.zeros(num_ranks)
 
+
+def batch_lengths_to_minibatches_lpt(batch_lengths: list[int], max_tokens_per_rank: int, num_ranks: int, rank: int):
+    """Distributes indices from a batch into minibatches using LPT (Longest Processing Time) algorithm.
+    
+    This implementation is inspired by the multipack sampler and uses a more sophisticated
+    approach than the greedy algorithm:
+    1. Sorts sequences by length (longest first) to ensure better load distribution
+    2. Uses binary search to find the maximum number of sequences that can fit in each minibatch
+    3. Applies LPT scheduling for optimal load balancing across ranks
+    
+    This minimizes the number of minibatches while ensuring even distribution of work,
+    preventing stragglers where one GPU finishes much later than others.
+    
+    Args:
+        batch_lengths: List of sequence lengths (in tokens)
+        max_tokens_per_rank: Maximum tokens allowed per rank per minibatch
+        num_ranks: Total number of distributed training ranks (GPUs)
+        rank: The specific rank to retrieve assigned indices for
+        
+    Returns:
+        List of lists, where each inner list contains indices assigned to this rank
+        for one minibatch. Index -1 indicates padding.
+    """
+    if not batch_lengths:
+        return []
+    
+    # Convert to numpy for efficient operations
+    lengths = np.array(batch_lengths, dtype=np.int64)
+    n_sequences = len(lengths)
+    
+    # Get sorted indices (longest first) for LPT
+    sorted_indices = np.argsort(lengths)[::-1]
+    sorted_lengths = lengths[sorted_indices]
+    
+    all_minibatches_for_rank = []
+    start_idx = 0
+    
+    while start_idx < n_sequences:
+        # Binary search for maximum sequences that fit using LPT
+        left, right = 1, min(n_sequences - start_idx + 1, n_sequences)
+        
+        while right - left > 1:
+            mid = (left + right) // 2
+            # Check if 'mid' sequences can fit using LPT scheduling
+            if _can_fit_with_lpt(sorted_lengths[start_idx:start_idx + mid], max_tokens_per_rank, num_ranks):
+                left = mid
+            else:
+                right = mid
+        
+        # Apply LPT to distribute 'left' sequences across ranks
+        n_to_assign = left
+        rank_assignments = _lpt_distribute(
+            sorted_lengths[start_idx:start_idx + n_to_assign],
+            sorted_indices[start_idx:start_idx + n_to_assign],
+            num_ranks
+        )
+        
+        # Get assignments for this specific rank
+        if rank < len(rank_assignments) and rank_assignments[rank]:
+            all_minibatches_for_rank.append(rank_assignments[rank])
+        else:
+            # This rank gets no sequences in this minibatch (padding)
+            all_minibatches_for_rank.append([-1])
+        
+        start_idx += n_to_assign
+    
+    return all_minibatches_for_rank
+
+
+def _can_fit_with_lpt(lengths: np.ndarray, max_tokens: int, num_ranks: int) -> bool:
+    """Check if sequences can fit within token limit using LPT scheduling.
+    
+    Uses a min-heap approach (simulated with array) for efficient checking.
+    """
+    if len(lengths) == 0:
+        return True
+        
+    # Initialize loads for each rank
+    loads = np.zeros(num_ranks, dtype=np.int64)
+    
+    # Assign each sequence to the least loaded rank
+    for length in lengths:
+        min_idx = np.argmin(loads)
+        loads[min_idx] += length
+        if loads[min_idx] > max_tokens:
+            return False
+    
+    return True
+
+
+def _lpt_distribute(lengths: np.ndarray, indices: np.ndarray, num_ranks: int) -> list[list[int]]:
+    """Distribute sequences to ranks using LPT algorithm.
+    
+    Returns assignments for all ranks to ensure consistency across distributed training.
+    """
+    loads = np.zeros(num_ranks, dtype=np.int64)
+    assignments = [[] for _ in range(num_ranks)]
+    
+    # Process sequences from longest to shortest
+    for length, idx in zip(lengths, indices):
+        # Assign to least loaded rank
+        min_rank = np.argmin(loads)
+        loads[min_rank] += length
+        assignments[min_rank].append(int(idx))
+    
+    return assignments
+
+@deprecated("Use batch_lengths_to_minibatches_lpt instead for better load balancing performance")
 def batch_lengths_to_minibatches(batch_lengths: list[int], max_tokens_per_rank: int, num_ranks: int, rank: int):
     """Distributes indices from a batch into minibatches across ranks.
 
@@ -252,7 +361,7 @@ class MaxTokensPerRankCollator:
             print(f"\033[38;5;196mremoved {len(batch) - len(batch_)} samples from batch because they are longer than the max tokens per gpu\033[0m")
         batch_lengths = [sample['len'] for sample in batch]
         batch_num_loss_counted_tokens = sum([sample['num_loss_counted_tokens'] for sample in batch])
-        all_minibatches_indices = batch_lengths_to_minibatches(batch_lengths, self.max_tokens_per_rank, self.world_size, self.rank)
+        all_minibatches_indices = batch_lengths_to_minibatches_lpt(batch_lengths, self.max_tokens_per_rank, self.world_size, self.rank)
         
         all_minibatches = []
         for mb_indices in all_minibatches_indices:

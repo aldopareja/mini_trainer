@@ -4,7 +4,8 @@ transformers
 typer
 liger-kernel-nightly
 aiofiles
-torch
+torch<2.7.0
 rich
-accelerate
 flash-attn
+pytest
+Deprecated

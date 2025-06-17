@@ -10,7 +10,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import pytest
-from sampler import batch_lengths_to_minibatches, batch_lengths_to_minibatches_lpt
+import time
+from sampler import batch_lengths_to_minibatches
+from batch_packer import batch_lengths_to_minibatches_lpt
 
 
 class TestBatchLengthsToMinibatches:
@@ -277,7 +279,7 @@ class TestAlgorithmComparison:
     """Compare greedy vs LPT algorithms side by side."""
     
     def compare_algorithms(self, batch_lengths, max_tokens, num_ranks=8):
-        """Run both algorithms and compare their efficiency metrics."""
+        """Run all algorithms and compare their efficiency metrics."""
         # Measure greedy algorithm
         greedy_stats = self._measure_algorithm(
             batch_lengths_to_minibatches, 
@@ -305,6 +307,7 @@ class TestAlgorithmComparison:
             ("Load balance ratio", 'load_balance_ratio', lambda g, l: f"{(l-g)/g*100:.1f}% better"),
             ("Load std dev", 'load_std', lambda g, l: f"{(g-l)/g*100:.1f}% lower"),
             ("Efficiency", 'efficiency', lambda g, l: f"{(l-g)/g*100:.1f}% higher"),
+            ("Execution time (ms)", 'execution_time_ms', lambda g, l: f"{(l-g)/g*100:.1f}% {'faster' if l < g else 'slower'}"),
         ]
         
         for name, key, improvement_fn in metrics:
@@ -322,6 +325,9 @@ class TestAlgorithmComparison:
         rank_loads = []
         total_minibatches = 0
         
+        # Time the algorithm execution
+        start_time = time.perf_counter()
+        
         for rank in range(num_ranks):
             rank_result = algorithm_fn(batch_lengths, max_tokens, num_ranks, rank)
             total_minibatches = max(total_minibatches, len(rank_result))
@@ -334,6 +340,8 @@ class TestAlgorithmComparison:
             
             rank_loads.append(rank_load)
         
+        execution_time = time.perf_counter() - start_time
+        
         return {
             'algorithm': name,
             'rank_loads': rank_loads,
@@ -342,7 +350,8 @@ class TestAlgorithmComparison:
             'load_std': np.std(rank_loads),
             'load_mean': np.mean(rank_loads),
             'load_balance_ratio': np.min(rank_loads) / np.max(rank_loads) if np.max(rank_loads) > 0 else 1.0,
-            'efficiency': sum(rank_loads) / (total_minibatches * num_ranks * max_tokens)
+            'efficiency': sum(rank_loads) / (total_minibatches * num_ranks * max_tokens),
+            'execution_time_ms': execution_time * 1000  # Convert to milliseconds
         }
     
     def test_comparison_all_scenarios(self):
@@ -392,6 +401,72 @@ class TestAlgorithmComparison:
             power_law.append(max(100, min(100000, length)))
         np.random.shuffle(power_law)
         self.compare_algorithms(power_law, 130000, 8)
+    
+    def test_speed_benchmark(self):
+        """Dedicated speed benchmark with multiple iterations for accurate timing."""
+        print("\n6. SPEED BENCHMARK (Multiple Iterations)")
+        print("-" * 50)
+        
+        # Generate representative test case
+        np.random.seed(42)
+        n_sequences = 1000
+        short_seqs = np.random.randint(100, 2000, size=int(n_sequences * 0.5))
+        medium_seqs = np.random.randint(2000, 20000, size=int(n_sequences * 0.3))
+        long_seqs = np.random.randint(20000, 60000, size=int(n_sequences * 0.15))
+        very_long_seqs = np.random.randint(60000, 100000, size=int(n_sequences * 0.05))
+        lengths = np.concatenate([short_seqs, medium_seqs, long_seqs, very_long_seqs])
+        np.random.shuffle(lengths)
+        batch_lengths = lengths.tolist()
+        
+        max_tokens = 130000
+        num_ranks = 8
+        num_iterations = 10
+        
+        # Benchmark greedy algorithm
+        greedy_times = []
+        for i in range(num_iterations):
+            start_time = time.perf_counter()
+            for rank in range(num_ranks):
+                batch_lengths_to_minibatches(batch_lengths, max_tokens, num_ranks, rank)
+            greedy_times.append(time.perf_counter() - start_time)
+        
+        # Benchmark LPT algorithm
+        lpt_times = []
+        for i in range(num_iterations):
+            start_time = time.perf_counter()
+            for rank in range(num_ranks):
+                batch_lengths_to_minibatches_lpt(batch_lengths, max_tokens, num_ranks, rank)
+            lpt_times.append(time.perf_counter() - start_time)
+        
+        # Calculate statistics
+        greedy_mean = np.mean(greedy_times) * 1000  # Convert to ms
+        greedy_std = np.std(greedy_times) * 1000
+        lpt_mean = np.mean(lpt_times) * 1000
+        lpt_std = np.std(lpt_times) * 1000
+        
+        speedup = greedy_mean / lpt_mean if lpt_mean > 0 else float('inf')
+        
+        print(f"Test setup: {len(batch_lengths)} sequences, {num_ranks} ranks, {num_iterations} iterations")
+        print(f"")
+        print(f"{'Algorithm':<15} {'Mean (ms)':>12} {'Std Dev (ms)':>15} {'Min (ms)':>12} {'Max (ms)':>12}")
+        print("-" * 75)
+        print(f"{'Greedy':<15} {greedy_mean:>12.2f} {greedy_std:>15.2f} {min(greedy_times)*1000:>12.2f} {max(greedy_times)*1000:>12.2f}")
+        print(f"{'LPT':<15} {lpt_mean:>12.2f} {lpt_std:>15.2f} {min(lpt_times)*1000:>12.2f} {max(lpt_times)*1000:>12.2f}")
+        print(f"")
+        if speedup > 1:
+            print(f"🚀 LPT is {speedup:.2f}x FASTER than Greedy")
+        elif speedup < 1:
+            print(f"⚠️  LPT is {1/speedup:.2f}x SLOWER than Greedy")
+        else:
+            print("⚖️  Both algorithms have similar performance")
+        
+        return {
+            'greedy_mean_ms': greedy_mean,
+            'greedy_std_ms': greedy_std,
+            'lpt_mean_ms': lpt_mean,
+            'lpt_std_ms': lpt_std,
+            'speedup_factor': speedup
+        }
 
 
 if __name__ == "__main__":
@@ -411,3 +486,6 @@ if __name__ == "__main__":
     # Run algorithm comparison
     comparison_tester = TestAlgorithmComparison()
     comparison_tester.test_comparison_all_scenarios()
+    
+    # Run dedicated speed benchmark
+    comparison_tester.test_speed_benchmark()

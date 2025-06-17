@@ -9,3 +9,4 @@ rich
 flash-attn
 pytest
 Deprecated
+numba

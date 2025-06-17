@@ -104,30 +104,76 @@ class TestBatchingEfficiency:
         return lengths.tolist()
     
     def measure_load_distribution(self, batch_lengths, max_tokens, num_ranks=8):
-        """Measure load distribution across ranks."""
-        rank_loads = []
-        total_minibatches = 0
-        
+        """Measure load distribution with focus on per-minibatch (row) balance."""
+        # Collect results for all ranks (columns)
+        all_rank_results = []
         for rank in range(num_ranks):
             rank_result = batch_lengths_to_minibatches(batch_lengths, max_tokens, num_ranks, rank)
-            total_minibatches = max(total_minibatches, len(rank_result))
+            all_rank_results.append(rank_result)
+        
+        # Determine total minibatches (rows in the matrix)
+        total_minibatches = max(len(r) for r in all_rank_results)
+        
+        # Analyze each minibatch (row) separately
+        minibatch_balance_scores = []
+        minibatch_efficiencies = []
+        total_tokens_used = 0
+        
+        for mb_idx in range(total_minibatches):
+            # Collect loads for this row across all columns (ranks)
+            row_loads = []
+            row_lengths = []  # Individual sequence lengths in this row
             
-            # Calculate total load for this rank
-            rank_load = 0
-            for minibatch in rank_result:
-                minibatch_load = sum(batch_lengths[i] for i in minibatch if i != -1)
-                rank_load += minibatch_load
+            for rank in range(num_ranks):
+                if mb_idx < len(all_rank_results[rank]):
+                    rank_mb = all_rank_results[rank][mb_idx]
+                    # Get actual sequence lengths (not indices)
+                    seq_lengths = [batch_lengths[i] for i in rank_mb if i != -1]
+                    row_lengths.extend(seq_lengths)
+                    row_loads.append(sum(seq_lengths))
+                else:
+                    row_loads.append(0)
             
-            rank_loads.append(rank_load)
+            # Calculate balance metrics for this row
+            if row_lengths:  # If there are any sequences in this row
+                # Variance of loads across ranks in this row
+                load_variance = np.var(row_loads)
+                load_std = np.std(row_loads)
+                
+                # Balance ratio: min/max load (closer to 1 is better)
+                non_zero_loads = [l for l in row_loads if l > 0]
+                if non_zero_loads:
+                    balance_ratio = min(non_zero_loads) / max(non_zero_loads)
+                else:
+                    balance_ratio = 1.0
+                
+                # Efficiency: how well we utilize capacity in this row
+                row_efficiency = sum(row_loads) / (num_ranks * max_tokens)
+                
+                minibatch_balance_scores.append(balance_ratio)
+                minibatch_efficiencies.append(row_efficiency)
+                total_tokens_used += sum(row_loads)
+        
+        # Calculate aggregate statistics
+        avg_row_balance = np.mean(minibatch_balance_scores) if minibatch_balance_scores else 0
+        worst_row_balance = np.min(minibatch_balance_scores) if minibatch_balance_scores else 0
+        avg_row_efficiency = np.mean(minibatch_efficiencies) if minibatch_efficiencies else 0
+        
+        # Overall efficiency considering wasted capacity
+        overall_efficiency = total_tokens_used / (total_minibatches * num_ranks * max_tokens)
         
         return {
-            'rank_loads': rank_loads,
             'total_minibatches': total_minibatches,
-            'load_variance': np.var(rank_loads),
-            'load_std': np.std(rank_loads),
-            'load_mean': np.mean(rank_loads),
-            'load_balance_ratio': np.min(rank_loads) / np.max(rank_loads) if np.max(rank_loads) > 0 else 1.0,
-            'efficiency': sum(rank_loads) / (total_minibatches * num_ranks * max_tokens)
+            'avg_row_balance_ratio': avg_row_balance,
+            'worst_row_balance_ratio': worst_row_balance,
+            'row_balance_std': np.std(minibatch_balance_scores) if minibatch_balance_scores else 0,
+            'avg_row_efficiency': avg_row_efficiency,
+            'overall_efficiency': overall_efficiency,
+            'total_sequences': len(batch_lengths),
+            'total_tokens': sum(batch_lengths),
+            # For backward compatibility
+            'load_balance_ratio': avg_row_balance,
+            'efficiency': overall_efficiency
         }
     
     def test_small_batch_efficiency(self):
@@ -140,9 +186,9 @@ class TestBatchingEfficiency:
         
         print(f"\nSmall batch efficiency stats:")
         print(f"  Total minibatches: {stats['total_minibatches']}")
-        print(f"  Load balance ratio: {stats['load_balance_ratio']:.3f}")
-        print(f"  Load std dev: {stats['load_std']:.0f}")
-        print(f"  Efficiency: {stats['efficiency']:.3f}")
+        print(f"  Avg row balance ratio: {stats['avg_row_balance_ratio']:.3f}")
+        print(f"  Worst row balance ratio: {stats['worst_row_balance_ratio']:.3f}")
+        print(f"  Overall efficiency: {stats['overall_efficiency']:.3f}")
         
         # Basic sanity checks
         assert stats['total_minibatches'] > 0
@@ -160,10 +206,9 @@ class TestBatchingEfficiency:
         print(f"\nLarge batch efficiency stats:")
         print(f"  Total sequences: {len(batch_lengths)}")
         print(f"  Total minibatches: {stats['total_minibatches']}")
-        print(f"  Load balance ratio: {stats['load_balance_ratio']:.3f}")
-        print(f"  Load std dev: {stats['load_std']:.0f}")
-        print(f"  Load mean: {stats['load_mean']:.0f}")
-        print(f"  Efficiency: {stats['efficiency']:.3f}")
+        print(f"  Avg row balance ratio: {stats['avg_row_balance_ratio']:.3f}")
+        print(f"  Worst row balance ratio: {stats['worst_row_balance_ratio']:.3f}")
+        print(f"  Overall efficiency: {stats['overall_efficiency']:.3f}")
         
         # Store baseline for comparison
         return stats
@@ -187,9 +232,9 @@ class TestBatchingEfficiency:
         print(f"\nVariable lengths efficiency stats:")
         print(f"  Total sequences: {len(batch_lengths)}")
         print(f"  Total minibatches: {stats['total_minibatches']}")
-        print(f"  Load balance ratio: {stats['load_balance_ratio']:.3f}")
-        print(f"  Load std dev: {stats['load_std']:.0f}")
-        print(f"  Efficiency: {stats['efficiency']:.3f}")
+        print(f"  Avg row balance ratio: {stats['avg_row_balance_ratio']:.3f}")
+        print(f"  Worst row balance ratio: {stats['worst_row_balance_ratio']:.3f}")
+        print(f"  Overall efficiency: {stats['overall_efficiency']:.3f}")
         
         # With current greedy algorithm, load balance might be poor
         # This test establishes baseline for improvement
@@ -200,12 +245,12 @@ class TestBatchingEfficiency:
         # Case 1: All sequences same length
         uniform_lengths = [15000] * 20
         stats1 = self.measure_load_distribution(uniform_lengths, 130000, 4)
-        print(f"\nUniform lengths - Load balance ratio: {stats1['load_balance_ratio']:.3f}")
+        print(f"\nUniform lengths - Avg row balance: {stats1['avg_row_balance_ratio']:.3f}")
         
         # Case 2: One very long sequence with many short ones
         mixed_lengths = [1000] * 50 + [95000]
         stats2 = self.measure_load_distribution(mixed_lengths, 130000, 4)
-        print(f"Mixed with outlier - Load balance ratio: {stats2['load_balance_ratio']:.3f}")
+        print(f"Mixed with outlier - Avg row balance: {stats2['avg_row_balance_ratio']:.3f}")
         
         # Case 3: Many sequences that barely fit (near max token limit)
         tight_fit = [120000] * 10
@@ -229,9 +274,9 @@ class TestBatchingEfficiency:
         
         stats1 = self.measure_load_distribution(bimodal, 130000, 8)
         print(f"\nBimodal distribution:")
-        print(f"  Load balance ratio: {stats1['load_balance_ratio']:.3f}")
+        print(f"  Avg row balance ratio: {stats1['avg_row_balance_ratio']:.3f}")
         print(f"  Total minibatches: {stats1['total_minibatches']}")
-        print(f"  Efficiency: {stats1['efficiency']:.3f}")
+        print(f"  Overall efficiency: {stats1['overall_efficiency']:.3f}")
         
         # Case 2: Power law distribution (few very long, many short)
         power_law = []
@@ -243,9 +288,9 @@ class TestBatchingEfficiency:
         
         stats2 = self.measure_load_distribution(power_law, 130000, 8)
         print(f"\nPower law distribution:")
-        print(f"  Load balance ratio: {stats2['load_balance_ratio']:.3f}")
+        print(f"  Avg row balance ratio: {stats2['avg_row_balance_ratio']:.3f}")
         print(f"  Total minibatches: {stats2['total_minibatches']}")
-        print(f"  Efficiency: {stats2['efficiency']:.3f}")
+        print(f"  Overall efficiency: {stats2['overall_efficiency']:.3f}")
         
         # Case 3: Clustered lengths (groups of similar sizes)
         cluster1 = [np.random.randint(1000, 2000) for _ in range(50)]
@@ -256,9 +301,9 @@ class TestBatchingEfficiency:
         
         stats3 = self.measure_load_distribution(clustered, 130000, 8)
         print(f"\nClustered lengths:")
-        print(f"  Load balance ratio: {stats3['load_balance_ratio']:.3f}")
+        print(f"  Avg row balance ratio: {stats3['avg_row_balance_ratio']:.3f}")
         print(f"  Total minibatches: {stats3['total_minibatches']}")
-        print(f"  Efficiency: {stats3['efficiency']:.3f}")
+        print(f"  Overall efficiency: {stats3['overall_efficiency']:.3f}")
         
         # Case 4: Extreme outliers (few sequences taking up most of max_tokens)
         normal_seqs = [np.random.randint(5000, 15000) for _ in range(50)]
@@ -268,9 +313,9 @@ class TestBatchingEfficiency:
         
         stats4 = self.measure_load_distribution(extreme, 130000, 8)
         print(f"\nExtreme outliers:")
-        print(f"  Load balance ratio: {stats4['load_balance_ratio']:.3f}")
+        print(f"  Avg row balance ratio: {stats4['avg_row_balance_ratio']:.3f}")
         print(f"  Total minibatches: {stats4['total_minibatches']}")
-        print(f"  Efficiency: {stats4['efficiency']:.3f}")
+        print(f"  Overall efficiency: {stats4['overall_efficiency']:.3f}")
         
         return stats1, stats2, stats3, stats4
 
@@ -299,14 +344,15 @@ class TestAlgorithmComparison:
         )
         
         # Print comparison
-        print(f"\n{'Metric':<25} {'Greedy':>12} {'LPT':>12} {'Improvement':>15}")
-        print("-" * 65)
+        print(f"\n{'Metric':<30} {'Greedy':>12} {'LPT':>12} {'Improvement':>18}")
+        print("-" * 75)
         
         metrics = [
             ("Total minibatches", 'total_minibatches', lambda g, l: f"{(g-l)/g*100:.1f}% fewer"),
-            ("Load balance ratio", 'load_balance_ratio', lambda g, l: f"{(l-g)/g*100:.1f}% better"),
-            ("Load std dev", 'load_std', lambda g, l: f"{(g-l)/g*100:.1f}% lower"),
-            ("Efficiency", 'efficiency', lambda g, l: f"{(l-g)/g*100:.1f}% higher"),
+            ("Avg row balance ratio", 'avg_row_balance_ratio', lambda g, l: f"{(l-g)/g*100:.1f}% better"),
+            ("Worst row balance ratio", 'worst_row_balance_ratio', lambda g, l: f"{(l-g)/g*100:.1f}% better"),
+            ("Row balance std dev", 'row_balance_std', lambda g, l: f"{(g-l)/g*100:.1f}% lower"),
+            ("Overall efficiency", 'overall_efficiency', lambda g, l: f"{(l-g)/g*100:.1f}% higher"),
             ("Execution time (ms)", 'execution_time_ms', lambda g, l: f"{(l-g)/g*100:.1f}% {'faster' if l < g else 'slower'}"),
         ]
         
@@ -321,37 +367,70 @@ class TestAlgorithmComparison:
         return greedy_stats, lpt_stats
     
     def _measure_algorithm(self, algorithm_fn, batch_lengths, max_tokens, num_ranks, name):
-        """Measure performance of a specific algorithm."""
-        rank_loads = []
-        total_minibatches = 0
-        
+        """Measure performance with focus on per-minibatch (row) balance."""
         # Time the algorithm execution
         start_time = time.perf_counter()
         
+        # Collect results for all ranks
+        all_rank_results = []
         for rank in range(num_ranks):
             rank_result = algorithm_fn(batch_lengths, max_tokens, num_ranks, rank)
-            total_minibatches = max(total_minibatches, len(rank_result))
-            
-            # Calculate total load for this rank
-            rank_load = 0
-            for minibatch in rank_result:
-                minibatch_load = sum(batch_lengths[i] for i in minibatch if i != -1)
-                rank_load += minibatch_load
-            
-            rank_loads.append(rank_load)
+            all_rank_results.append(rank_result)
         
         execution_time = time.perf_counter() - start_time
         
+        # Determine total minibatches (rows)
+        total_minibatches = max(len(r) for r in all_rank_results)
+        
+        # Analyze each minibatch (row) separately
+        minibatch_balance_scores = []
+        minibatch_efficiencies = []
+        total_tokens_used = 0
+        
+        for mb_idx in range(total_minibatches):
+            # Collect loads for this row across all columns (ranks)
+            row_loads = []
+            
+            for rank in range(num_ranks):
+                if mb_idx < len(all_rank_results[rank]):
+                    rank_mb = all_rank_results[rank][mb_idx]
+                    # Calculate load for this rank in this minibatch
+                    seq_lengths = [batch_lengths[i] for i in rank_mb if i != -1]
+                    row_loads.append(sum(seq_lengths))
+                else:
+                    row_loads.append(0)
+            
+            # Calculate balance for this row
+            non_zero_loads = [l for l in row_loads if l > 0]
+            if non_zero_loads:
+                balance_ratio = min(non_zero_loads) / max(non_zero_loads)
+                row_efficiency = sum(row_loads) / (num_ranks * max_tokens)
+                minibatch_balance_scores.append(balance_ratio)
+                minibatch_efficiencies.append(row_efficiency)
+                total_tokens_used += sum(row_loads)
+        
+        # Calculate aggregate statistics
+        avg_row_balance = np.mean(minibatch_balance_scores) if minibatch_balance_scores else 0
+        worst_row_balance = np.min(minibatch_balance_scores) if minibatch_balance_scores else 0
+        avg_row_efficiency = np.mean(minibatch_efficiencies) if minibatch_efficiencies else 0
+        row_balance_std = np.std(minibatch_balance_scores) if minibatch_balance_scores else 0
+        
+        # Overall efficiency
+        overall_efficiency = total_tokens_used / (total_minibatches * num_ranks * max_tokens)
+        
         return {
             'algorithm': name,
-            'rank_loads': rank_loads,
             'total_minibatches': total_minibatches,
-            'load_variance': np.var(rank_loads),
-            'load_std': np.std(rank_loads),
-            'load_mean': np.mean(rank_loads),
-            'load_balance_ratio': np.min(rank_loads) / np.max(rank_loads) if np.max(rank_loads) > 0 else 1.0,
-            'efficiency': sum(rank_loads) / (total_minibatches * num_ranks * max_tokens),
-            'execution_time_ms': execution_time * 1000  # Convert to milliseconds
+            'avg_row_balance_ratio': avg_row_balance,
+            'worst_row_balance_ratio': worst_row_balance,
+            'row_balance_std': row_balance_std,
+            'avg_row_efficiency': avg_row_efficiency,
+            'overall_efficiency': overall_efficiency,
+            'execution_time_ms': execution_time * 1000,
+            # For backward compatibility in printing
+            'load_balance_ratio': avg_row_balance,
+            'efficiency': overall_efficiency,
+            'load_std': row_balance_std * 1000  # Scale for display
         }
     
     def test_comparison_all_scenarios(self):

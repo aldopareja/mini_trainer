@@ -114,6 +114,9 @@ def _batch_to_minibatches_lpt_core(lengths: np.ndarray, max_tokens: int64,
     sorted_indices = np.argsort(lengths)[::-1]
     sorted_lengths = lengths[sorted_indices]
     
+    # Calculate cumulative sum for efficient range queries
+    lengths_cumsum = np.cumsum(sorted_lengths)
+    
     # Pre-allocate heap (1-indexed, so size n+1)
     heap = np.zeros(num_ranks + 1, dtype=np.int64)
     heap_id = np.zeros(num_ranks + 1, dtype=np.int64)
@@ -125,9 +128,23 @@ def _batch_to_minibatches_lpt_core(lengths: np.ndarray, max_tokens: int64,
     n_minibatches = 0
     
     start_idx = 0
+    s = 0  # Current cumulative sum
+    
     while start_idx < n_sequences:
         # Binary search for maximum sequences that fit
-        left, right = 1, min(n_sequences - start_idx + 1, num_ranks * 2)
+        # Search up to the point where total tokens would exceed capacity
+        remaining = n_sequences - start_idx
+        
+        # Find upper bound: sequences whose cumsum doesn't exceed current + capacity
+        if start_idx > 0:
+            s = lengths_cumsum[start_idx - 1]
+        else:
+            s = 0
+            
+        # Binary search in the remaining sequences
+        left = 1
+        right = min(remaining + 1, 
+                   1 + np.searchsorted(lengths_cumsum[start_idx:], s + max_tokens * num_ranks, 'right'))
         
         while right - left > 1:
             mid = (left + right) // 2
@@ -137,8 +154,17 @@ def _batch_to_minibatches_lpt_core(lengths: np.ndarray, max_tokens: int64,
             else:
                 right = mid
         
-        # Get sequences assigned to this rank
+        # Check if we can allocate at least one sequence per rank
         n_to_assign = left
+        if n_to_assign < num_ranks and n_to_assign < remaining:
+            # Try to assign at least num_ranks sequences if possible
+            n_to_assign = min(num_ranks, remaining)
+            # Verify this works
+            if not _lpt_check_heap(heap, sorted_lengths[start_idx:start_idx + n_to_assign], 
+                                  max_tokens, num_ranks):
+                n_to_assign = left  # Fall back to safe value
+        
+        # Get sequences assigned to this rank
         rank_sequences = _lpt_distribute_heap(
             heap, heap_id,
             sorted_lengths[start_idx:start_idx + n_to_assign],

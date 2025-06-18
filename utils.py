@@ -17,7 +17,7 @@ def get_caller(num_frames=1):
     line_number = frame.f_lineno
     return f"In {file_name}, line {line_number}"
 
-def log_rank_0(msg, include_caller=False, rank=None, to_print=False):
+def log_rank_0(msg, include_caller=False, rank=None, to_print=True):
     if rank is None:
         rank = get_rank() if is_initialized() else 0
     if rank <= 0:

@@ -41,20 +41,6 @@ def save_model(fsdp_model, samples_seen, output_dir, model_name_or_path):
     from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
     state_dict = get_model_state_dict(fsdp_model, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
     state_dict = {k:v.to(torch.bfloat16) for k,v in state_dict.items()}
-
-
-    from torch.optim.optimizer import AdamW
-    optimizer = AdamW(fsdp_model.parameters(), lr=1e-4)
-    # important
-    from svd_continual import optim_wrapper
-
-    def optim_wrapper(optimizer, model):
-        def step(optimizer=optimizer):
-            model.project_gradients()
-            optimizer.step()
-        optimizer.step = step
-        return optimizer
-    optimizer = optim_wrapper(optimizer, fsdp_model)
     
     if rank == 0:
         pattern = "model{suffix}.safetensors"

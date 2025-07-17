@@ -39,8 +39,22 @@ def save_model(fsdp_model, samples_seen, output_dir, model_name_or_path):
     os.makedirs(save_directory, exist_ok=True)
     # Get full state dict
     from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
-    state_dict = get_model_state_dict(fsdp_model, options=StateDictOptions(full_state_dict=True))
+    state_dict = get_model_state_dict(fsdp_model, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
     state_dict = {k:v.to(torch.bfloat16) for k,v in state_dict.items()}
+
+
+    from torch.optim.optimizer import AdamW
+    optimizer = AdamW(fsdp_model.parameters(), lr=1e-4)
+    # important
+    from svd_continual import optim_wrapper
+
+    def optim_wrapper(optimizer, model):
+        def step(optimizer=optimizer):
+            model.project_gradients()
+            optimizer.step()
+        optimizer.step = step
+        return optimizer
+    optimizer = optim_wrapper(optimizer, fsdp_model)
     
     if rank == 0:
         pattern = "model{suffix}.safetensors"
@@ -236,16 +250,15 @@ rclone copy --copy-links /new_data/experiments_rh/phi-4_limo_trainer_pipe_cleane
         --data-path ./some_product_puzzle_tokenized_qwen1.5b.jsonl \
         --data-path ./mihir_prob.jsonl \
         --output-dir /new_data/experiments_rh/mihir_prob_qwen1.5b_v2     \
-torchrun --nnodes=1 --nproc-per-node=8 train.py   \
-        --output-dir /new_data/experiments_rh/siddantv2/     \
-        --data-path ./siddhant.jsonl \
-        --model-name-or-path Qwen/Qwen2.5-1.5B-instruct \
-        --min-samples-per-checkpoint 10000      \
+torchrun --nnodes=1 --nproc-per-node=8 train.py \
+        --output-dir /cloud/misc/aldo/experiment/qwen32b-expert-iteration-test \
+        --data-path ./tokenized_data.jsonl \
+        --model-name-or-path Qwen/Qwen3-32B \
+        --min-samples-per-checkpoint 3400 \
         --num-warmup-steps 20 \
-        --max-tokens-per-gpu 60000              \
-        --batch-size 128                       \
-        --use-liger-kernels                    \
-        --seed 893                               \
-        --fsdp-sharding-strategy FULL_SHARD \
-        --learning-rate 6e-6
+        --max-tokens-per-gpu 33000 \
+        --batch-size 128 \
+        --use-liger-kernels \
+        --seed 893 \
+        --learning-rate 5e-6
 '''

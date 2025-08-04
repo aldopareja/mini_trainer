@@ -8,7 +8,6 @@ from typer import Typer, Option
 
 from async_structured_logger import AsyncStructuredLogger
 import torch
-import torch.distributed as dist
 
 from batch_metrics import BatchMetrics
 from sampler import get_data_loader
@@ -40,11 +39,8 @@ def save_model(fsdp_model, samples_seen, output_dir, model_name_or_path):
     os.makedirs(save_directory, exist_ok=True)
     # Get full state dict
     from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
-    state_dict = get_model_state_dict(fsdp_model, options=StateDictOptions(full_state_dict=True))
-    inner = getattr(fsdp_model, "module", fsdp_model)
-    if hasattr(inner, "prepare_state_dict_for_save"):
-        state_dict = inner.prepare_state_dict_for_save(state_dict)
-    state_dict = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
+    state_dict = get_model_state_dict(fsdp_model, options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+    state_dict = {k:v.to(torch.bfloat16) for k,v in state_dict.items()}
     
     if rank == 0:
         pattern = "model{suffix}.safetensors"
@@ -77,7 +73,7 @@ def train(model, optimizer, lr_scheduler, data_loader, output_dir, min_samples_p
     model.train()
     metric_logger = AsyncStructuredLogger(output_dir + f"/training_metrics_{os.environ.get('RANK')}.jsonl")
     world_size = int(os.environ["WORLD_SIZE"])
-    is_main_process = dist.get_rank() == 0
+    is_main_process = os.environ.get("RANK") == "0"
 
     batch_totals = BatchMetrics()
     step = 0
@@ -172,7 +168,6 @@ def main(
     lr_scheduler: str = Option("constant_with_warmup", help="Learning rate scheduler type"),
     seed: int = Option(42, help="Random seed for reproducibility"),
     use_liger_kernels: bool = Option(False, help="Whether to use Liger kernels"),
-    orthogonal_subspace_learning: bool = Option(False, help="Enable SVD based orthogonal subspace training"),
     output_dir: str = Option(..., help="Directory to save checkpoints and logs (required)"),
     logging_level: LogLevelEnum = Option(
         LogLevelEnum.INFO, 
@@ -186,7 +181,7 @@ def main(
     output_path.mkdir(parents=True, exist_ok=True)
     
     # Log parameters only on rank 0
-    rank = dist.get_rank()
+    rank = int(os.environ.get("RANK", 0))
     if rank == 0:
         params = {
             "model_name_or_path": model_name_or_path,
@@ -198,7 +193,6 @@ def main(
             "lr_scheduler": lr_scheduler,
             "seed": seed,
             "use_liger_kernels": use_liger_kernels,
-            "orthogonal_subspace_learning": orthogonal_subspace_learning,
             "output_dir": output_dir,
             "logging_level": logging_level.value,
             "min_samples_per_checkpoint": min_samples_per_checkpoint,
@@ -213,13 +207,8 @@ def main(
         print(f"Training parameters saved to {params_path}")
 
     setup_logger(level=logging_level.value)
-    # If Orthogonal Subspace Learning is enabled, loads a model with decomposed trainable low-rank + fixed high-rank subspace weights (see svd_utils)
-    model = setup_model(
-        model_name_or_path=model_name_or_path,
-        use_liger_kernels=use_liger_kernels,
-        orthogonal_subspace_learning=orthogonal_subspace_learning,
-        rank=rank,
-    )
+    model = setup_model(model_name_or_path=model_name_or_path,
+                        use_liger_kernels=use_liger_kernels,)
     model, optimizer, lr_scheduler = setup_training_components(model,
                                                                learning_rate=learning_rate,
                                                                num_warmup_steps=num_warmup_steps,
@@ -253,10 +242,9 @@ torchrun --nnodes=1 --nproc-per-node=8 train.py \
         --model-name-or-path Qwen/Qwen3-32B \
         --min-samples-per-checkpoint 3400 \
         --num-warmup-steps 20 \
-        --max-tokens-per-gpu 60000              \
-        --batch-size 128                       \
-        --use-liger-kernels                    \
-        --seed 893                               \
-        --fsdp-sharding-strategy FULL_SHARD \
-        --learning-rate 6e-6
+        --max-tokens-per-gpu 33000 \
+        --batch-size 128 \
+        --use-liger-kernels \
+        --seed 893 \
+        --learning-rate 5e-6
 '''
